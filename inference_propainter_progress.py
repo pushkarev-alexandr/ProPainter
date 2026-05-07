@@ -79,6 +79,12 @@ if __name__ == "__main__":
     parser.add_argument("--save_fps", type=int, default=24)
     parser.add_argument("--save_frames", action="store_true")
     parser.add_argument("--fp16", action="store_true")
+    parser.add_argument(
+        "--blend_feather",
+        type=int,
+        default=0,
+        help="Gaussian blur kernel size for soft mask blending (0 disables feathering).",
+    )
     args = parser.parse_args()
 
     use_half = bool(args.fp16)
@@ -299,9 +305,19 @@ if __name__ == "__main__":
             pred_img = (pred_img + 1) / 2
             pred_img = pred_img.cpu().permute(0, 2, 3, 1).numpy() * 255
             binary_masks = masks_dilated[0, neighbor_ids, :, :, :].cpu().permute(0, 2, 3, 1).numpy().astype(np.uint8)
+            soft_masks = binary_masks.astype(np.float32)
+            feather = max(0, int(args.blend_feather))
+            if feather > 0:
+                if feather % 2 == 0:
+                    feather += 1
+                for m_idx in range(len(neighbor_ids)):
+                    # Blur mask edges to reduce hard seams between inpainted and original content.
+                    soft_masks[m_idx, :, :, 0] = cv2.GaussianBlur(soft_masks[m_idx, :, :, 0], (feather, feather), 0)
             for i in range(len(neighbor_ids)):
                 idx = neighbor_ids[i]
-                img = np.array(pred_img[i]).astype(np.uint8) * binary_masks[i] + ori_frames[idx] * (1 - binary_masks[i])
+                alpha = np.clip(soft_masks[i], 0.0, 1.0)
+                img = np.array(pred_img[i], dtype=np.float32) * alpha + ori_frames[idx].astype(np.float32) * (1.0 - alpha)
+                img = np.clip(img, 0, 255).astype(np.uint8)
                 if comp_frames[idx] is None:
                     comp_frames[idx] = img
                 else:
