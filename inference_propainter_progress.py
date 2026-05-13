@@ -31,6 +31,7 @@ from model.modules.flow_comp_raft import RAFT_bi
 from model.propainter import InpaintGenerator
 from model.recurrent_flow_completion import RecurrentFlowCompleteNet
 from utils.download_util import load_file_from_url
+from utils.propainter_crop_utils import smooth_center_trajectory
 
 
 OBJECT_CROP_PADDING_RATIO = 0.20
@@ -417,6 +418,7 @@ def build_crop_windows(
     frame_width: int,
     frame_height: int,
     padding_ratio: float = OBJECT_CROP_PADDING_RATIO,
+    center_smooth_sigma: float = 0.0,
 ) -> list[CropWindow]:
     visible: dict[int, tuple[float, float, float, float]] = {}
     max_width = 0.0
@@ -441,13 +443,18 @@ def build_crop_windows(
         frame_height=frame_height,
     )
     visible_indices = sorted(visible)
-    windows: list[CropWindow] = []
+    raw_centers: list[tuple[float, float]] = []
     for frame_index in range(frame_count):
         if frame_index in visible:
             cx, cy = visible[frame_index][0], visible[frame_index][1]
         else:
             nearest = min(visible_indices, key=lambda idx: abs(idx - frame_index))
             cx, cy = visible[nearest][0], visible[nearest][1]
+        raw_centers.append((cx, cy))
+
+    centers = smooth_center_trajectory(raw_centers, sigma=center_smooth_sigma)
+    windows: list[CropWindow] = []
+    for cx, cy in centers:
         x = int(round(cx - crop_width / 2.0))
         y = int(round(cy - crop_height / 2.0))
         x = max(0, min(x, frame_width - crop_width))
@@ -620,6 +627,7 @@ def run_object_crop_mode(
             frame_count=len(frames),
             frame_width=frame_width,
             frame_height=frame_height,
+            center_smooth_sigma=args.crop_center_smooth_sigma,
         )
         crop_frames_np: list[np.ndarray] = []
         crop_masks_np: list[np.ndarray] = []
@@ -704,6 +712,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--save_fps", type=int, default=24)
     parser.add_argument("--save_frames", action="store_true")
     parser.add_argument("--fp16", action="store_true")
+    parser.add_argument(
+        "--crop_center_smooth_sigma",
+        type=float,
+        default=0.0,
+        help="Gaussian smoothing sigma in frames for object crop centers (0 disables smoothing).",
+    )
     parser.add_argument(
         "--blend_feather",
         type=int,
