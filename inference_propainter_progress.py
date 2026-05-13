@@ -1,12 +1,20 @@
 # -*- coding: utf-8 -*-
+from __future__ import annotations
+
 import argparse
 import json
+import math
 import os
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any
 
 import cv2
 import imageio
 import numpy as np
+import scipy.ndimage
 import torch
+from PIL import Image
 from tqdm import tqdm
 
 from core.utils import to_tensors
@@ -16,7 +24,6 @@ from inference_propainter import (
     imwrite,
     pretrain_model_url,
     read_frame_from_videos,
-    read_mask,
     resize_frames,
 )
 from model.misc import get_device
@@ -25,6 +32,11 @@ from model.propainter import InpaintGenerator
 from model.recurrent_flow_completion import RecurrentFlowCompleteNet
 from utils.download_util import load_file_from_url
 
+
+OBJECT_CROP_PADDING_RATIO = 0.20
+OBJECT_CROP_MIN_SHORT_SIDE = 512
+OBJECT_CROP_MAX_PIXELS = 960 * 720
+OBJECT_BOXES_FILENAME = "object_boxes.json"
 
 STAGE_RANGES: dict[str, tuple[float, float]] = {
     "prepare": (0.0, 8.0),
@@ -36,17 +48,42 @@ STAGE_RANGES: dict[str, tuple[float, float]] = {
 }
 
 
+@dataclass(slots=True)
+class LoadedModels:
+    fix_raft: RAFT_bi
+    fix_flow_complete: RecurrentFlowCompleteNet
+    model: InpaintGenerator
+
+
+@dataclass(slots=True)
+class CropWindow:
+    x: int
+    y: int
+    width: int
+    height: int
+
+
+@dataclass(slots=True)
+class ObjectTrack:
+    label: int
+    boxes_by_frame: dict[int, list[float]]
+
+
 def emit_progress(
     stage: str,
     *,
     current: int,
     total: int,
     message: str,
+    overall_start: float | None = None,
+    overall_end: float | None = None,
 ) -> None:
     start, end = STAGE_RANGES[stage]
     safe_total = max(1, total)
     ratio = min(max(current / safe_total, 0.0), 1.0)
     overall = start + (end - start) * ratio
+    if overall_start is not None and overall_end is not None:
+        overall = overall_start + (overall_end - overall_start) * (overall / 100.0)
     payload = {
         "stage": stage,
         "current": current,
@@ -58,86 +95,85 @@ def emit_progress(
     print(f"PROGRESS_JSON: {json.dumps(payload, ensure_ascii=True)}", flush=True)
 
 
-if __name__ == "__main__":
-    device = get_device()
+def round_up_to_multiple(value: float | int, multiple: int = 8) -> int:
+    return max(multiple, int(math.ceil(float(value) / multiple) * multiple))
 
-    parser = argparse.ArgumentParser()
-    parser.add_argument("-i", "--video", type=str, default="inputs/object_removal/bmx-trees")
-    parser.add_argument("-m", "--mask", type=str, default="inputs/object_removal/bmx-trees_mask")
-    parser.add_argument("-o", "--output", type=str, default="results")
-    parser.add_argument("--resize_ratio", type=float, default=1.0)
-    parser.add_argument("--height", type=int, default=-1)
-    parser.add_argument("--width", type=int, default=-1)
-    parser.add_argument("--mask_dilation", type=int, default=4)
-    parser.add_argument("--ref_stride", type=int, default=10)
-    parser.add_argument("--neighbor_length", type=int, default=10)
-    parser.add_argument("--subvideo_length", type=int, default=80)
-    parser.add_argument("--raft_iter", type=int, default=20)
-    parser.add_argument("--mode", default="video_inpainting", choices=["video_inpainting", "video_outpainting"])
-    parser.add_argument("--scale_h", type=float, default=1.0)
-    parser.add_argument("--scale_w", type=float, default=1.2)
-    parser.add_argument("--save_fps", type=int, default=24)
-    parser.add_argument("--save_frames", action="store_true")
-    parser.add_argument("--fp16", action="store_true")
-    parser.add_argument(
-        "--blend_feather",
-        type=int,
-        default=0,
-        help="Gaussian blur kernel size for soft mask blending (0 disables feathering).",
-    )
-    args = parser.parse_args()
 
-    use_half = bool(args.fp16)
-    if device == torch.device("cpu"):
-        use_half = False
+def fit_crop_size_to_budget(
+    *,
+    width: float,
+    height: float,
+    frame_width: int,
+    frame_height: int,
+    min_short_side: int = OBJECT_CROP_MIN_SHORT_SIDE,
+    max_pixels: int = OBJECT_CROP_MAX_PIXELS,
+) -> tuple[int, int]:
+    if width <= 0 or height <= 0:
+        raise ValueError("Crop size must be positive")
 
-    emit_progress("prepare", current=0, total=1, message="Reading input video and mask")
-    frames, fps, size, video_name = read_frame_from_videos(args.video)
-    if args.width != -1 and args.height != -1:
-        size = (args.width, args.height)
-    if args.resize_ratio != 1.0:
-        size = (int(args.resize_ratio * size[0]), int(args.resize_ratio * size[1]))
-    frames, size, out_size = resize_frames(frames, size)
-    fps = args.save_fps if fps is None else fps
-    save_root = os.path.join(args.output, video_name)
-    os.makedirs(save_root, exist_ok=True)
+    target_width = float(width)
+    target_height = float(height)
+    frame_short_side = max(8, min(frame_width, frame_height))
+    effective_min_short_side = min(min_short_side, frame_short_side)
+    short_side = min(target_width, target_height)
+    if short_side < effective_min_short_side:
+        scale = effective_min_short_side / short_side
+        target_width *= scale
+        target_height *= scale
 
-    if args.mode == "video_inpainting":
-        frames_len = len(frames)
-        flow_masks, masks_dilated = read_mask(
-            args.mask,
-            frames_len,
-            size,
-            flow_mask_dilates=args.mask_dilation,
-            mask_dilates=args.mask_dilation,
-        )
-        w, h = size
-    elif args.mode == "video_outpainting":
-        if args.scale_h is None or args.scale_w is None:
-            raise AssertionError("Please provide a outpainting scale (s_h, s_w).")
-        frames, flow_masks, masks_dilated, size = extrapolation(frames, (args.scale_h, args.scale_w))
-        w, h = size
+    if max_pixels > 0 and target_width * target_height > max_pixels:
+        scale = math.sqrt(max_pixels / (target_width * target_height))
+        target_width *= scale
+        target_height *= scale
+
+    target_width = min(target_width, float(frame_width))
+    target_height = min(target_height, float(frame_height))
+    return round_up_to_multiple(target_width), round_up_to_multiple(target_height)
+
+
+def binary_mask(mask: np.ndarray, th: float = 0.1) -> np.ndarray:
+    return np.where(mask > th, 1, 0)
+
+
+def read_mask_images(mask_path: str | Path, length: int) -> list[Image.Image]:
+    path = Path(mask_path)
+    if path.suffix.lower() in {".jpg", ".jpeg", ".png"}:
+        masks = [Image.open(path)]
     else:
-        raise NotImplementedError
+        masks = [Image.open(item) for item in sorted(path.iterdir()) if item.suffix.lower() == ".png"]
+    if len(masks) == 1:
+        masks = masks * length
+    if len(masks) != length:
+        raise ValueError(f"Mask frame count ({len(masks)}) does not match video frame count ({length})")
+    return masks
 
-    masked_frame_for_save = []
-    for i in range(len(frames)):
-        mask_ = np.expand_dims(np.array(masks_dilated[i]), 2).repeat(3, axis=2) / 255.0
-        img = np.array(frames[i])
-        green = np.zeros([h, w, 3])
-        green[:, :, 1] = 255
-        alpha = 0.6
-        fuse_img = (1 - alpha) * img + alpha * green
-        fuse_img = mask_ * fuse_img + (1 - mask_) * img
-        masked_frame_for_save.append(fuse_img.astype(np.uint8))
-    emit_progress("prepare", current=1, total=1, message="Input prepared")
 
-    frames_inp = [np.array(f).astype(np.uint8) for f in frames]
-    frames = to_tensors()(frames).unsqueeze(0) * 2 - 1
-    flow_masks = to_tensors()(flow_masks).unsqueeze(0)
-    masks_dilated = to_tensors()(masks_dilated).unsqueeze(0)
-    frames, flow_masks, masks_dilated = frames.to(device), flow_masks.to(device), masks_dilated.to(device)
+def prepare_mask_images(
+    masks_img: list[Image.Image],
+    *,
+    size: tuple[int, int],
+    flow_mask_dilates: int,
+    mask_dilates: int,
+) -> tuple[list[Image.Image], list[Image.Image]]:
+    flow_masks: list[Image.Image] = []
+    masks_dilated: list[Image.Image] = []
+    for mask_img in masks_img:
+        mask_img = mask_img.resize(size, Image.NEAREST)
+        mask = np.array(mask_img.convert("L"))
+        if flow_mask_dilates > 0:
+            flow_mask = scipy.ndimage.binary_dilation(mask, iterations=flow_mask_dilates).astype(np.uint8)
+        else:
+            flow_mask = binary_mask(mask).astype(np.uint8)
+        if mask_dilates > 0:
+            dilated = scipy.ndimage.binary_dilation(mask, iterations=mask_dilates).astype(np.uint8)
+        else:
+            dilated = binary_mask(mask).astype(np.uint8)
+        flow_masks.append(Image.fromarray(flow_mask * 255))
+        masks_dilated.append(Image.fromarray(dilated * 255))
+    return flow_masks, masks_dilated
 
+
+def load_models(device: torch.device) -> LoadedModels:
     ckpt_path = load_file_from_url(
         url=os.path.join(pretrain_model_url, "raft-things.pth"),
         model_dir="weights",
@@ -166,9 +202,40 @@ if __name__ == "__main__":
     )
     model = InpaintGenerator(model_path=ckpt_path).to(device)
     model.eval()
+    return LoadedModels(fix_raft=fix_raft, fix_flow_complete=fix_flow_complete, model=model)
 
-    video_length = frames.size(1)
-    print(f"\nProcessing: {video_name} [{video_length} frames]...")
+
+def run_propainter_inpaint(
+    *,
+    frames_pil: list[Image.Image],
+    flow_masks_pil: list[Image.Image],
+    masks_dilated_pil: list[Image.Image],
+    args: argparse.Namespace,
+    device: torch.device,
+    models: LoadedModels,
+    use_half: bool,
+    progress_start: float | None = None,
+    progress_end: float | None = None,
+    progress_message_suffix: str = "",
+) -> list[np.ndarray]:
+    video_length = len(frames_pil)
+    w, h = frames_pil[0].size
+    frames_inp = [np.array(frame).astype(np.uint8) for frame in frames_pil]
+    frames = to_tensors()(frames_pil).unsqueeze(0) * 2 - 1
+    flow_masks = to_tensors()(flow_masks_pil).unsqueeze(0)
+    masks_dilated = to_tensors()(masks_dilated_pil).unsqueeze(0)
+    frames, flow_masks, masks_dilated = frames.to(device), flow_masks.to(device), masks_dilated.to(device)
+
+    def progress(stage: str, current: int, total: int, message: str) -> None:
+        emit_progress(
+            stage,
+            current=current,
+            total=total,
+            message=f"{message}{progress_message_suffix}",
+            overall_start=progress_start,
+            overall_end=progress_end,
+        )
+
     with torch.no_grad():
         if frames.size(-1) <= 640:
             short_clip_len = 12
@@ -185,21 +252,21 @@ if __name__ == "__main__":
             for step_idx, f in enumerate(range(0, video_length, short_clip_len), start=1):
                 end_f = min(video_length, f + short_clip_len)
                 if f == 0:
-                    flows_f, flows_b = fix_raft(frames[:, f:end_f], iters=args.raft_iter)
+                    flows_f, flows_b = models.fix_raft(frames[:, f:end_f], iters=args.raft_iter)
                 else:
-                    flows_f, flows_b = fix_raft(frames[:, f - 1 : end_f], iters=args.raft_iter)
+                    flows_f, flows_b = models.fix_raft(frames[:, f - 1 : end_f], iters=args.raft_iter)
                 gt_flows_f_list.append(flows_f)
                 gt_flows_b_list.append(flows_b)
                 torch.cuda.empty_cache()
-                emit_progress("raft", current=step_idx, total=raft_steps, message="RAFT flow estimation")
-            gt_flows_f = torch.cat(gt_flows_f_list, dim=1)
-            gt_flows_b = torch.cat(gt_flows_b_list, dim=1)
-            gt_flows_bi = (gt_flows_f, gt_flows_b)
+                progress("raft", step_idx, raft_steps, "RAFT flow estimation")
+            gt_flows_bi = (torch.cat(gt_flows_f_list, dim=1), torch.cat(gt_flows_b_list, dim=1))
         else:
-            gt_flows_bi = fix_raft(frames, iters=args.raft_iter)
+            gt_flows_bi = models.fix_raft(frames, iters=args.raft_iter)
             torch.cuda.empty_cache()
-            emit_progress("raft", current=1, total=1, message="RAFT flow estimation")
+            progress("raft", 1, 1, "RAFT flow estimation")
 
+        fix_flow_complete = models.fix_flow_complete
+        model = models.model
         if use_half:
             frames, flow_masks, masks_dilated = frames.half(), flow_masks.half(), masks_dilated.half()
             gt_flows_bi = (gt_flows_bi[0].half(), gt_flows_bi[1].half())
@@ -228,15 +295,13 @@ if __name__ == "__main__":
                 pred_flows_f.append(pred_flows_bi_sub[0][:, pad_len_s : e_f - s_f - pad_len_e])
                 pred_flows_b.append(pred_flows_bi_sub[1][:, pad_len_s : e_f - s_f - pad_len_e])
                 torch.cuda.empty_cache()
-                emit_progress("flow_complete", current=step_idx, total=flow_steps, message="Flow completion")
-            pred_flows_f = torch.cat(pred_flows_f, dim=1)
-            pred_flows_b = torch.cat(pred_flows_b, dim=1)
-            pred_flows_bi = (pred_flows_f, pred_flows_b)
+                progress("flow_complete", step_idx, flow_steps, "Flow completion")
+            pred_flows_bi = (torch.cat(pred_flows_f, dim=1), torch.cat(pred_flows_b, dim=1))
         else:
             pred_flows_bi, _ = fix_flow_complete.forward_bidirect_flow(gt_flows_bi, flow_masks)
             pred_flows_bi = fix_flow_complete.combine_flow(gt_flows_bi, pred_flows_bi, flow_masks)
             torch.cuda.empty_cache()
-            emit_progress("flow_complete", current=1, total=1, message="Flow completion")
+            progress("flow_complete", 1, 1, "Flow completion")
 
         masked_frames = frames * (1 - masks_dilated)
         subvideo_length_img_prop = min(100, args.subvideo_length)
@@ -249,7 +314,6 @@ if __name__ == "__main__":
                 e_f = min(video_length, f + subvideo_length_img_prop + pad_len)
                 pad_len_s = max(0, f) - s_f
                 pad_len_e = e_f - min(video_length, f + subvideo_length_img_prop)
-
                 b, t, _, _, _ = masks_dilated[:, s_f:e_f].size()
                 pred_flows_bi_sub = (pred_flows_bi[0][:, s_f : e_f - 1], pred_flows_bi[1][:, s_f : e_f - 1])
                 prop_imgs_sub, updated_local_masks_sub = model.img_propagation(
@@ -262,12 +326,10 @@ if __name__ == "__main__":
                     b, t, 3, h, w
                 ) * masks_dilated[:, s_f:e_f]
                 updated_masks_sub = updated_local_masks_sub.view(b, t, 1, h, w)
-
                 updated_frames.append(updated_frames_sub[:, pad_len_s : e_f - s_f - pad_len_e])
                 updated_masks.append(updated_masks_sub[:, pad_len_s : e_f - s_f - pad_len_e])
                 torch.cuda.empty_cache()
-                emit_progress("img_prop", current=step_idx, total=img_steps, message="Image propagation")
-
+                progress("img_prop", step_idx, img_steps, "Image propagation")
             updated_frames = torch.cat(updated_frames, dim=1)
             updated_masks = torch.cat(updated_masks, dim=1)
         else:
@@ -276,16 +338,11 @@ if __name__ == "__main__":
             updated_frames = frames * (1 - masks_dilated) + prop_imgs.view(b, t, 3, h, w) * masks_dilated
             updated_masks = updated_local_masks.view(b, t, 1, h, w)
             torch.cuda.empty_cache()
-            emit_progress("img_prop", current=1, total=1, message="Image propagation")
+            progress("img_prop", 1, 1, "Image propagation")
 
-    ori_frames = frames_inp
-    comp_frames = [None] * video_length
+    comp_frames: list[np.ndarray | None] = [None] * video_length
     neighbor_stride = args.neighbor_length // 2
-    if video_length > args.subvideo_length:
-        ref_num = args.subvideo_length // args.ref_stride
-    else:
-        ref_num = -1
-
+    ref_num = args.subvideo_length // args.ref_stride if video_length > args.subvideo_length else -1
     transformer_steps = len(range(0, video_length, neighbor_stride))
     for step_idx, f in enumerate(tqdm(range(0, video_length, neighbor_stride)), start=1):
         neighbor_ids = [i for i in range(max(0, f - neighbor_stride), min(video_length, f + neighbor_stride + 1))]
@@ -297,10 +354,9 @@ if __name__ == "__main__":
             pred_flows_bi[0][:, neighbor_ids[:-1], :, :, :],
             pred_flows_bi[1][:, neighbor_ids[:-1], :, :, :],
         )
-
         with torch.no_grad():
             l_t = len(neighbor_ids)
-            pred_img = model(selected_imgs, selected_pred_flows_bi, selected_masks, selected_update_masks, l_t)
+            pred_img = models.model(selected_imgs, selected_pred_flows_bi, selected_masks, selected_update_masks, l_t)
             pred_img = pred_img.view(-1, 3, h, w)
             pred_img = (pred_img + 1) / 2
             pred_img = pred_img.cpu().permute(0, 2, 3, 1).numpy() * 255
@@ -311,33 +367,169 @@ if __name__ == "__main__":
                 if feather % 2 == 0:
                     feather += 1
                 for m_idx in range(len(neighbor_ids)):
-                    # Blur mask edges to reduce hard seams between inpainted and original content.
                     soft_masks[m_idx, :, :, 0] = cv2.GaussianBlur(soft_masks[m_idx, :, :, 0], (feather, feather), 0)
-            for i in range(len(neighbor_ids)):
-                idx = neighbor_ids[i]
+            for i, idx in enumerate(neighbor_ids):
                 alpha = np.clip(soft_masks[i], 0.0, 1.0)
-                img = np.array(pred_img[i], dtype=np.float32) * alpha + ori_frames[idx].astype(np.float32) * (1.0 - alpha)
+                img = np.array(pred_img[i], dtype=np.float32) * alpha + frames_inp[idx].astype(np.float32) * (1.0 - alpha)
                 img = np.clip(img, 0, 255).astype(np.uint8)
                 if comp_frames[idx] is None:
                     comp_frames[idx] = img
                 else:
-                    comp_frames[idx] = comp_frames[idx].astype(np.float32) * 0.5 + img.astype(np.float32) * 0.5
-                comp_frames[idx] = comp_frames[idx].astype(np.uint8)
+                    comp_frames[idx] = (comp_frames[idx].astype(np.float32) * 0.5 + img.astype(np.float32) * 0.5).astype(
+                        np.uint8
+                    )
         torch.cuda.empty_cache()
-        emit_progress("transformer", current=step_idx, total=transformer_steps, message="Transformer inpainting")
+        progress("transformer", step_idx, transformer_steps, "Transformer inpainting")
 
-    if args.save_frames:
-        frame_total = max(1, video_length)
-        for idx in range(video_length):
-            f = comp_frames[idx]
-            f = cv2.resize(f, out_size, interpolation=cv2.INTER_CUBIC)
-            f = cv2.cvtColor(f, cv2.COLOR_BGR2RGB)
-            img_save_root = os.path.join(save_root, "frames", str(idx).zfill(4) + ".png")
-            imwrite(f, img_save_root)
+    return [frame if frame is not None else frames_inp[idx] for idx, frame in enumerate(comp_frames)]
+
+
+def load_label_masks(mask_path: str | Path, length: int, size: tuple[int, int]) -> list[np.ndarray]:
+    masks = read_mask_images(mask_path, length)
+    return [np.array(mask.resize(size, Image.NEAREST).convert("L"), dtype=np.uint8) for mask in masks]
+
+
+def load_object_tracks(object_boxes_path: str | Path) -> list[ObjectTrack]:
+    payload = json.loads(Path(object_boxes_path).read_text(encoding="utf-8"))
+    tracks: dict[int, dict[int, list[float]]] = {}
+    for frame in payload.get("frames", []):
+        frame_index = int(frame.get("frame_index", 0))
+        for obj in frame.get("objects", []):
+            label = int(obj.get("label", 0))
+            box = obj.get("box_xywh")
+            if label <= 0 or not isinstance(box, list) or len(box) != 4:
+                continue
+            tracks.setdefault(label, {})[frame_index] = [float(value) for value in box]
+    return [ObjectTrack(label=label, boxes_by_frame=boxes) for label, boxes in sorted(tracks.items())]
+
+
+def normalized_box_to_pixels(box_xywh: list[float], frame_width: int, frame_height: int) -> tuple[float, float, float, float]:
+    x, y, w, h = box_xywh
+    x1 = x * frame_width
+    y1 = y * frame_height
+    return x1, y1, w * frame_width, h * frame_height
+
+
+def build_crop_windows(
+    *,
+    track: ObjectTrack,
+    frame_count: int,
+    frame_width: int,
+    frame_height: int,
+    padding_ratio: float = OBJECT_CROP_PADDING_RATIO,
+) -> list[CropWindow]:
+    visible: dict[int, tuple[float, float, float, float]] = {}
+    max_width = 0.0
+    max_height = 0.0
+    for frame_index, box in track.boxes_by_frame.items():
+        x, y, width, height = normalized_box_to_pixels(box, frame_width, frame_height)
+        if width <= 0 or height <= 0:
+            continue
+        expanded_width = width * (1.0 + padding_ratio * 2.0)
+        expanded_height = height * (1.0 + padding_ratio * 2.0)
+        visible[frame_index] = (x + width / 2.0, y + height / 2.0, expanded_width, expanded_height)
+        max_width = max(max_width, expanded_width)
+        max_height = max(max_height, expanded_height)
+
+    if not visible:
+        raise ValueError(f"No valid boxes found for object label {track.label}")
+
+    crop_width, crop_height = fit_crop_size_to_budget(
+        width=max_width,
+        height=max_height,
+        frame_width=frame_width,
+        frame_height=frame_height,
+    )
+    visible_indices = sorted(visible)
+    windows: list[CropWindow] = []
+    for frame_index in range(frame_count):
+        if frame_index in visible:
+            cx, cy = visible[frame_index][0], visible[frame_index][1]
+        else:
+            nearest = min(visible_indices, key=lambda idx: abs(idx - frame_index))
+            cx, cy = visible[nearest][0], visible[nearest][1]
+        x = int(round(cx - crop_width / 2.0))
+        y = int(round(cy - crop_height / 2.0))
+        x = max(0, min(x, frame_width - crop_width))
+        y = max(0, min(y, frame_height - crop_height))
+        windows.append(CropWindow(x=x, y=y, width=crop_width, height=crop_height))
+    return windows
+
+
+def crop_with_padding(
+    image: np.ndarray,
+    window: CropWindow,
+    *,
+    border_type: int,
+    value: int | tuple[int, int, int] = 0,
+) -> np.ndarray:
+    img_h, img_w = image.shape[:2]
+    x1, y1 = window.x, window.y
+    x2, y2 = window.x + window.width, window.y + window.height
+    src_x1, src_y1 = max(0, x1), max(0, y1)
+    src_x2, src_y2 = min(img_w, x2), min(img_h, y2)
+    crop = image[src_y1:src_y2, src_x1:src_x2]
+    if crop.size == 0:
+        shape = (window.height, window.width) if image.ndim == 2 else (window.height, window.width, image.shape[2])
+        return np.zeros(shape, dtype=image.dtype)
+    pad_left = src_x1 - x1
+    pad_top = src_y1 - y1
+    pad_right = x2 - src_x2
+    pad_bottom = y2 - src_y2
+    return cv2.copyMakeBorder(crop, pad_top, pad_bottom, pad_left, pad_right, border_type, value=value)
+
+
+def paste_object_crop(
+    *,
+    composite_frames: list[np.ndarray],
+    crop_frames: list[np.ndarray],
+    crop_masks: list[np.ndarray],
+    windows: list[CropWindow],
+    blend_feather: int,
+) -> None:
+    feather = max(0, int(blend_feather))
+    if feather > 0 and feather % 2 == 0:
+        feather += 1
+    for idx, window in enumerate(windows):
+        frame = composite_frames[idx]
+        frame_h, frame_w = frame.shape[:2]
+        x1, y1 = window.x, window.y
+        x2, y2 = window.x + window.width, window.y + window.height
+        dst_x1, dst_y1 = max(0, x1), max(0, y1)
+        dst_x2, dst_y2 = min(frame_w, x2), min(frame_h, y2)
+        if dst_x1 >= dst_x2 or dst_y1 >= dst_y2:
+            continue
+        crop_x1, crop_y1 = dst_x1 - x1, dst_y1 - y1
+        crop_x2, crop_y2 = crop_x1 + (dst_x2 - dst_x1), crop_y1 + (dst_y2 - dst_y1)
+        mask = crop_masks[idx][crop_y1:crop_y2, crop_x1:crop_x2].astype(np.float32) / 255.0
+        if not np.any(mask):
+            continue
+        if feather > 0:
+            mask = cv2.GaussianBlur(mask, (feather, feather), 0)
+        alpha = np.clip(mask[:, :, None], 0.0, 1.0)
+        source = crop_frames[idx][crop_y1:crop_y2, crop_x1:crop_x2].astype(np.float32)
+        target = frame[dst_y1:dst_y2, dst_x1:dst_x2].astype(np.float32)
+        frame[dst_y1:dst_y2, dst_x1:dst_x2] = np.clip(source * alpha + target * (1.0 - alpha), 0, 255).astype(np.uint8)
+
+
+def save_video_outputs(
+    *,
+    save_root: str | Path,
+    comp_frames: list[np.ndarray],
+    fps: float,
+    out_size: tuple[int, int],
+    save_frames: bool,
+) -> None:
+    save_root = Path(save_root)
+    if save_frames:
+        frame_total = max(1, len(comp_frames))
+        for idx, frame in enumerate(comp_frames):
+            output = cv2.resize(frame, out_size, interpolation=cv2.INTER_CUBIC)
+            output = cv2.cvtColor(output, cv2.COLOR_BGR2RGB)
+            imwrite(output, str(save_root / "frames" / f"{idx:04d}.png"))
             emit_progress("save", current=idx + 1, total=frame_total, message="Saving output frames")
 
-    masked_frame_for_save = [cv2.resize(f, out_size) for f in masked_frame_for_save]
-    comp_frames = [cv2.resize(f, out_size) for f in comp_frames]
+    comp_frames = [cv2.resize(frame, out_size) for frame in comp_frames]
     ffmpeg_kwargs = {
         "fps": fps,
         "codec": "libx264rgb",
@@ -351,9 +543,222 @@ if __name__ == "__main__":
             "rgb24",
         ],
     }
-    imageio.mimwrite(os.path.join(save_root, "masked_in.mp4"), masked_frame_for_save, fps=fps, quality=7, macro_block_size=1)
-    imageio.mimwrite(os.path.join(save_root, "inpaint_out.mp4"), comp_frames, **ffmpeg_kwargs)
+    imageio.mimwrite(str(save_root / "inpaint_out.mp4"), comp_frames, **ffmpeg_kwargs)
     emit_progress("save", current=1, total=1, message="Video outputs saved")
 
+
+def run_full_frame_mode(
+    *,
+    args: argparse.Namespace,
+    device: torch.device,
+    models: LoadedModels,
+    use_half: bool,
+    frames: list[Image.Image],
+    fps: float,
+    size: tuple[int, int],
+    out_size: tuple[int, int],
+    save_root: Path,
+) -> None:
+    if args.mode == "video_inpainting":
+        masks_img = read_mask_images(args.mask, len(frames))
+        flow_masks, masks_dilated = prepare_mask_images(
+            masks_img,
+            size=size,
+            flow_mask_dilates=args.mask_dilation,
+            mask_dilates=args.mask_dilation,
+        )
+    elif args.mode == "video_outpainting":
+        if args.scale_h is None or args.scale_w is None:
+            raise AssertionError("Please provide a outpainting scale (s_h, s_w).")
+        frames, flow_masks, masks_dilated, size = extrapolation(frames, (args.scale_h, args.scale_w))
+    else:
+        raise NotImplementedError
+
+    emit_progress("prepare", current=1, total=1, message="Input prepared")
+    comp_frames = run_propainter_inpaint(
+        frames_pil=frames,
+        flow_masks_pil=flow_masks,
+        masks_dilated_pil=masks_dilated,
+        args=args,
+        device=device,
+        models=models,
+        use_half=use_half,
+    )
+    save_video_outputs(save_root=save_root, comp_frames=comp_frames, fps=fps, out_size=out_size, save_frames=args.save_frames)
+
+
+def run_object_crop_mode(
+    *,
+    args: argparse.Namespace,
+    device: torch.device,
+    models: LoadedModels,
+    use_half: bool,
+    frames: list[Image.Image],
+    fps: float,
+    out_size: tuple[int, int],
+    save_root: Path,
+) -> None:
+    frame_arrays = [np.array(frame).astype(np.uint8) for frame in frames]
+    frame_height, frame_width = frame_arrays[0].shape[:2]
+    label_masks = load_label_masks(args.mask, len(frames), (frame_width, frame_height))
+    tracks = load_object_tracks(args.object_boxes)
+    if not tracks:
+        raise ValueError(f"No object tracks found in {args.object_boxes}")
+
+    composite_frames = [frame.copy() for frame in frame_arrays]
+    emit_progress("prepare", current=1, total=1, message=f"Prepared {len(tracks)} object tracks")
+    work_start, work_end = STAGE_RANGES["raft"][0], STAGE_RANGES["transformer"][1]
+    object_span = (work_end - work_start) / max(1, len(tracks))
+
+    debug_root = save_root / "object_debug_crops"
+    if args.save_object_debug_crops:
+        debug_root.mkdir(parents=True, exist_ok=True)
+
+    for object_index, track in enumerate(tracks):
+        windows = build_crop_windows(
+            track=track,
+            frame_count=len(frames),
+            frame_width=frame_width,
+            frame_height=frame_height,
+        )
+        crop_frames_np: list[np.ndarray] = []
+        crop_masks_np: list[np.ndarray] = []
+        for frame_idx, window in enumerate(windows):
+            object_mask = np.where(label_masks[frame_idx] == track.label, 255, 0).astype(np.uint8)
+            crop_frames_np.append(
+                crop_with_padding(frame_arrays[frame_idx], window, border_type=cv2.BORDER_REPLICATE)
+            )
+            crop_masks_np.append(
+                crop_with_padding(object_mask, window, border_type=cv2.BORDER_CONSTANT, value=0)
+            )
+
+        if args.save_object_debug_crops:
+            imageio.mimwrite(
+                str(debug_root / f"object_{track.label:03d}_crop.mp4"),
+                crop_frames_np,
+                fps=fps,
+                quality=7,
+                macro_block_size=1,
+            )
+
+        crop_frames_pil = [Image.fromarray(frame) for frame in crop_frames_np]
+        crop_masks_pil = [Image.fromarray(mask) for mask in crop_masks_np]
+        flow_masks, masks_dilated_pil = prepare_mask_images(
+            crop_masks_pil,
+            size=crop_frames_pil[0].size,
+            flow_mask_dilates=args.mask_dilation,
+            mask_dilates=args.mask_dilation,
+        )
+        crop_masks_dilated_np = [
+            np.array(m.convert("L"), dtype=np.uint8) for m in masks_dilated_pil
+        ]
+        progress_start = work_start + object_span * object_index
+        progress_end = progress_start + object_span
+        crop_result = run_propainter_inpaint(
+            frames_pil=crop_frames_pil,
+            flow_masks_pil=flow_masks,
+            masks_dilated_pil=masks_dilated_pil,
+            args=args,
+            device=device,
+            models=models,
+            use_half=use_half,
+            progress_start=progress_start,
+            progress_end=progress_end,
+            progress_message_suffix=f" (object {track.label})",
+        )
+        paste_object_crop(
+            composite_frames=composite_frames,
+            crop_frames=crop_result,
+            crop_masks=crop_masks_dilated_np,
+            windows=windows,
+            blend_feather=args.blend_feather,
+        )
+
+    save_video_outputs(
+        save_root=save_root,
+        comp_frames=composite_frames,
+        fps=fps,
+        out_size=out_size,
+        save_frames=args.save_frames,
+    )
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("-i", "--video", type=str, default="inputs/object_removal/bmx-trees")
+    parser.add_argument("-m", "--mask", type=str, default="inputs/object_removal/bmx-trees_mask")
+    parser.add_argument("-o", "--output", type=str, default="results")
+    parser.add_argument("--object_boxes", type=str, default=None)
+    parser.add_argument("--save_object_debug_crops", action="store_true")
+    parser.add_argument("--resize_ratio", type=float, default=1.0)
+    parser.add_argument("--height", type=int, default=-1)
+    parser.add_argument("--width", type=int, default=-1)
+    parser.add_argument("--mask_dilation", type=int, default=4)
+    parser.add_argument("--ref_stride", type=int, default=10)
+    parser.add_argument("--neighbor_length", type=int, default=10)
+    parser.add_argument("--subvideo_length", type=int, default=80)
+    parser.add_argument("--raft_iter", type=int, default=20)
+    parser.add_argument("--mode", default="video_inpainting", choices=["video_inpainting", "video_outpainting"])
+    parser.add_argument("--scale_h", type=float, default=1.0)
+    parser.add_argument("--scale_w", type=float, default=1.2)
+    parser.add_argument("--save_fps", type=int, default=24)
+    parser.add_argument("--save_frames", action="store_true")
+    parser.add_argument("--fp16", action="store_true")
+    parser.add_argument(
+        "--blend_feather",
+        type=int,
+        default=0,
+        help="Gaussian blur kernel size for soft mask blending (0 disables feathering).",
+    )
+    return parser
+
+
+def main() -> None:
+    device = get_device()
+    args = build_parser().parse_args()
+    use_half = bool(args.fp16)
+    if device == torch.device("cpu"):
+        use_half = False
+
+    emit_progress("prepare", current=0, total=1, message="Reading input video and mask")
+    frames, fps, size, video_name = read_frame_from_videos(args.video)
+    if args.width != -1 and args.height != -1:
+        size = (args.width, args.height)
+    if args.resize_ratio != 1.0:
+        size = (int(args.resize_ratio * size[0]), int(args.resize_ratio * size[1]))
+    frames, size, out_size = resize_frames(frames, size)
+    fps = args.save_fps if fps is None else fps
+    save_root = Path(args.output) / video_name
+    save_root.mkdir(parents=True, exist_ok=True)
+
+    models = load_models(device)
+    print(f"\nProcessing: {video_name} [{len(frames)} frames]...")
+    if args.object_boxes:
+        run_object_crop_mode(
+            args=args,
+            device=device,
+            models=models,
+            use_half=use_half,
+            frames=frames,
+            fps=fps,
+            out_size=out_size,
+            save_root=save_root,
+        )
+    else:
+        run_full_frame_mode(
+            args=args,
+            device=device,
+            models=models,
+            use_half=use_half,
+            frames=frames,
+            fps=fps,
+            size=size,
+            out_size=out_size,
+            save_root=save_root,
+        )
     print(f"\nAll results are saved in {save_root}")
     torch.cuda.empty_cache()
+
+
+if __name__ == "__main__":
+    main()
