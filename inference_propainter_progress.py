@@ -411,7 +411,65 @@ def normalized_box_to_pixels(box_xywh: list[float], frame_width: int, frame_heig
     return x1, y1, w * frame_width, h * frame_height
 
 
-def build_crop_windows(
+def build_crop_windows_union(
+    *,
+    track: ObjectTrack,
+    frame_count: int,
+    frame_width: int,
+    frame_height: int,
+    padding_ratio: float = OBJECT_CROP_PADDING_RATIO,
+) -> list[CropWindow]:
+    """One fixed crop rectangle for all frames: union of per-frame expanded boxes.
+
+    If ``fit_crop_size_to_budget`` shrinks the window below the pixel union (``OBJECT_CROP_MAX_PIXELS``),
+    the window is still centered on that union and clamped to the frame; some object pixels may fall
+    outside the crop.
+    """
+    ux1 = math.inf
+    uy1 = math.inf
+    ux2 = -math.inf
+    uy2 = -math.inf
+    for _frame_index, box in track.boxes_by_frame.items():
+        x, y, width, height = normalized_box_to_pixels(box, frame_width, frame_height)
+        if width <= 0 or height <= 0:
+            continue
+        expanded_width = width * (1.0 + padding_ratio * 2.0)
+        expanded_height = height * (1.0 + padding_ratio * 2.0)
+        cx = x + width / 2.0
+        cy = y + height / 2.0
+        half_w = expanded_width / 2.0
+        half_h = expanded_height / 2.0
+        rx1 = cx - half_w
+        ry1 = cy - half_h
+        rx2 = cx + half_w
+        ry2 = cy + half_h
+        ux1 = min(ux1, rx1)
+        uy1 = min(uy1, ry1)
+        ux2 = max(ux2, rx2)
+        uy2 = max(uy2, ry2)
+
+    if ux1 == math.inf:
+        raise ValueError(f"No valid boxes found for object label {track.label}")
+
+    union_w = ux2 - ux1
+    union_h = uy2 - uy1
+    crop_width, crop_height = fit_crop_size_to_budget(
+        width=union_w,
+        height=union_h,
+        frame_width=frame_width,
+        frame_height=frame_height,
+    )
+    cx = (ux1 + ux2) / 2.0
+    cy = (uy1 + uy2) / 2.0
+    win_x = int(round(cx - crop_width / 2.0))
+    win_y = int(round(cy - crop_height / 2.0))
+    win_x = max(0, min(win_x, frame_width - crop_width))
+    win_y = max(0, min(win_y, frame_height - crop_height))
+    window = CropWindow(x=win_x, y=win_y, width=crop_width, height=crop_height)
+    return [window] * frame_count
+
+
+def build_crop_windows_tracking(
     *,
     track: ObjectTrack,
     frame_count: int,
@@ -622,13 +680,21 @@ def run_object_crop_mode(
         debug_root.mkdir(parents=True, exist_ok=True)
 
     for object_index, track in enumerate(tracks):
-        windows = build_crop_windows(
-            track=track,
-            frame_count=len(frames),
-            frame_width=frame_width,
-            frame_height=frame_height,
-            center_smooth_sigma=args.crop_center_smooth_sigma,
-        )
+        if args.object_crop_strategy == "union":
+            windows = build_crop_windows_union(
+                track=track,
+                frame_count=len(frames),
+                frame_width=frame_width,
+                frame_height=frame_height,
+            )
+        else:
+            windows = build_crop_windows_tracking(
+                track=track,
+                frame_count=len(frames),
+                frame_width=frame_width,
+                frame_height=frame_height,
+                center_smooth_sigma=args.crop_center_smooth_sigma,
+            )
         crop_frames_np: list[np.ndarray] = []
         crop_masks_np: list[np.ndarray] = []
         for frame_idx, window in enumerate(windows):
@@ -713,10 +779,17 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--save_frames", action="store_true")
     parser.add_argument("--fp16", action="store_true")
     parser.add_argument(
+        "--object_crop_strategy",
+        type=str,
+        default="union",
+        choices=["union", "tracking"],
+        help="union: fixed crop from union of all boxes per track; tracking: moving window + optional center smoothing.",
+    )
+    parser.add_argument(
         "--crop_center_smooth_sigma",
         type=float,
         default=0.0,
-        help="Gaussian smoothing sigma in frames for object crop centers (0 disables smoothing).",
+        help="Gaussian smoothing sigma in frames for object crop centers when --object_crop_strategy tracking (0 disables).",
     )
     parser.add_argument(
         "--blend_feather",
