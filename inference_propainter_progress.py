@@ -581,35 +581,15 @@ def save_video_outputs(
     *,
     save_root: str | Path,
     comp_frames: list[np.ndarray],
-    fps: float,
     out_size: tuple[int, int],
-    save_frames: bool,
 ) -> None:
     save_root = Path(save_root)
-    if save_frames:
-        frame_total = max(1, len(comp_frames))
-        for idx, frame in enumerate(comp_frames):
-            output = cv2.resize(frame, out_size, interpolation=cv2.INTER_CUBIC)
-            output = cv2.cvtColor(output, cv2.COLOR_BGR2RGB)
-            imwrite(output, str(save_root / "frames" / f"{idx:04d}.png"))
-            emit_progress("save", current=idx + 1, total=frame_total, message="Saving output frames")
-
-    comp_frames = [cv2.resize(frame, out_size) for frame in comp_frames]
-    ffmpeg_kwargs = {
-        "fps": fps,
-        "codec": "libx264rgb",
-        "macro_block_size": 1,
-        "ffmpeg_params": [
-            "-crf",
-            "0",
-            "-preset",
-            "slow",
-            "-pix_fmt",
-            "rgb24",
-        ],
-    }
-    imageio.mimwrite(str(save_root / "inpaint_out.mp4"), comp_frames, **ffmpeg_kwargs)
-    emit_progress("save", current=1, total=1, message="Video outputs saved")
+    frame_total = max(1, len(comp_frames))
+    for idx, frame in enumerate(comp_frames):
+        output = cv2.resize(frame, out_size, interpolation=cv2.INTER_CUBIC)
+        output = cv2.cvtColor(output, cv2.COLOR_BGR2RGB)
+        imwrite(output, str(save_root / "frames" / f"{idx:04d}.png"))
+        emit_progress("save", current=idx + 1, total=frame_total, message="Saving output frames")
 
 
 def run_full_frame_mode(
@@ -649,7 +629,7 @@ def run_full_frame_mode(
         models=models,
         use_half=use_half,
     )
-    save_video_outputs(save_root=save_root, comp_frames=comp_frames, fps=fps, out_size=out_size, save_frames=args.save_frames)
+    save_video_outputs(save_root=save_root, comp_frames=comp_frames, out_size=out_size)
 
 
 def run_object_crop_mode(
@@ -751,9 +731,7 @@ def run_object_crop_mode(
     save_video_outputs(
         save_root=save_root,
         comp_frames=composite_frames,
-        fps=fps,
         out_size=out_size,
-        save_frames=args.save_frames,
     )
 
 
