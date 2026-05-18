@@ -31,12 +31,10 @@ from model.modules.flow_comp_raft import RAFT_bi
 from model.propainter import InpaintGenerator
 from model.recurrent_flow_completion import RecurrentFlowCompleteNet
 from utils.download_util import load_file_from_url
-from utils.propainter_crop_utils import smooth_center_trajectory
+from utils.propainter_crop_utils import fit_crop_size_to_budget, smooth_center_trajectory
 
 
 OBJECT_CROP_PADDING_RATIO = 0.20
-OBJECT_CROP_MIN_SHORT_SIDE = 512
-OBJECT_CROP_MAX_PIXELS = 960 * 720
 OBJECT_BOXES_FILENAME = "object_boxes.json"
 
 STAGE_RANGES: dict[str, tuple[float, float]] = {
@@ -94,42 +92,6 @@ def emit_progress(
         "message": message,
     }
     print(f"PROGRESS_JSON: {json.dumps(payload, ensure_ascii=True)}", flush=True)
-
-
-def round_up_to_multiple(value: float | int, multiple: int = 8) -> int:
-    return max(multiple, int(math.ceil(float(value) / multiple) * multiple))
-
-
-def fit_crop_size_to_budget(
-    *,
-    width: float,
-    height: float,
-    frame_width: int,
-    frame_height: int,
-    min_short_side: int = OBJECT_CROP_MIN_SHORT_SIDE,
-    max_pixels: int = OBJECT_CROP_MAX_PIXELS,
-) -> tuple[int, int]:
-    if width <= 0 or height <= 0:
-        raise ValueError("Crop size must be positive")
-
-    target_width = float(width)
-    target_height = float(height)
-    frame_short_side = max(8, min(frame_width, frame_height))
-    effective_min_short_side = min(min_short_side, frame_short_side)
-    short_side = min(target_width, target_height)
-    if short_side < effective_min_short_side:
-        scale = effective_min_short_side / short_side
-        target_width *= scale
-        target_height *= scale
-
-    if max_pixels > 0 and target_width * target_height > max_pixels:
-        scale = math.sqrt(max_pixels / (target_width * target_height))
-        target_width *= scale
-        target_height *= scale
-
-    target_width = min(target_width, float(frame_width))
-    target_height = min(target_height, float(frame_height))
-    return round_up_to_multiple(target_width), round_up_to_multiple(target_height)
 
 
 def binary_mask(mask: np.ndarray, th: float = 0.1) -> np.ndarray:
@@ -421,9 +383,9 @@ def build_crop_windows_union(
 ) -> list[CropWindow]:
     """One fixed crop rectangle for all frames: union of per-frame expanded boxes.
 
-    If ``fit_crop_size_to_budget`` shrinks the window below the pixel union (``OBJECT_CROP_MAX_PIXELS``),
-    the window is still centered on that union and clamped to the frame; some object pixels may fall
-    outside the crop.
+    ``fit_crop_size_to_budget`` scales the union so its long side is ``OBJECT_CROP_TARGET_LONG_SIDE``
+    (512 by default). If the budget step shrinks the window below the pixel union, the window stays
+    centered on the union and clamped to the frame; some object pixels may fall outside the crop.
     """
     ux1 = math.inf
     uy1 = math.inf

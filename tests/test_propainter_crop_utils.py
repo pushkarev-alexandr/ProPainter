@@ -9,7 +9,7 @@ PROPAINTER_ROOT = Path(__file__).resolve().parents[1]
 if str(PROPAINTER_ROOT) not in sys.path:
     sys.path.insert(0, str(PROPAINTER_ROOT))
 
-from utils.propainter_crop_utils import smooth_center_trajectory
+from utils.propainter_crop_utils import fit_crop_size_to_budget, smooth_center_trajectory
 
 
 def test_smooth_center_trajectory_sigma_zero_returns_input() -> None:
@@ -33,3 +33,27 @@ def test_smooth_center_trajectory_reduces_center_noise() -> None:
     raw_error = np.mean([abs(x - base_x) for x, _ in centers])
     smoothed_error = np.mean([abs(x - base_x) for x, _ in smoothed])
     assert smoothed_error < raw_error
+
+
+def test_fit_crop_size_scales_by_long_side_to_target() -> None:
+    # Padded union ~219x460 on 1920x1080 → long side 460 → ~243x512
+    crop_w, crop_h = fit_crop_size_to_budget(
+        width=219.0,
+        height=460.0,
+        frame_width=1920,
+        frame_height=1080,
+        target_long_side=512,
+    )
+    assert crop_h == 512
+    assert 240 <= crop_w <= 248
+
+
+def test_fit_crop_size_does_not_fill_full_frame_height_for_narrow_union() -> None:
+    crop_w, crop_h = fit_crop_size_to_budget(
+        width=219.0,
+        height=460.0,
+        frame_width=1920,
+        frame_height=1080,
+        target_long_side=512,
+    )
+    assert crop_h < 1080
